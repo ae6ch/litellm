@@ -25,7 +25,11 @@ class BaseRoutingStrategy(ABC):
         if should_batch_redis_writes:
             self.setup_sync_task(default_sync_interval)
 
-        self.in_memory_keys_to_update: set[str] = set()  # Set with max size of 1000 keys
+        # Dirty set: keys whose in-memory value changed since the last Redis sync.
+        # There is NO size bound (an earlier comment here claimed "max size of 1000 keys",
+        # but add_to_in_memory_keys_to_update is a bare set.add()), so this MUST be drained
+        # by _sync_in_memory_spend_with_redis or it grows for the process lifetime.
+        self.in_memory_keys_to_update: set[str] = set()
 
     def setup_sync_task(self, default_sync_interval: float | None):
         """Setup the sync task in a way that's compatible with FastAPI"""
@@ -189,9 +193,17 @@ class BaseRoutingStrategy(ABC):
             if self.dual_cache.redis_cache is None:
                 return
 
-            # 2. Fetch all current provider spend from Redis to update in-memory cache
+            # 2. Fetch all current provider spend from Redis to update in-memory cache.
+            #
+            # DRAIN the dirty set, do not merely read it. A key's in-memory value can only
+            # change via _increment_value_in_current_window, which re-adds the key here (it
+            # is the single call site of add_to_in_memory_keys_to_update), so anything that
+            # still needs syncing comes back on a later tick. Reading without draining
+            # retains every key ever touched for the lifetime of the process and makes each
+            # tick O(all keys ever seen) -- including lines 3-4 below, which run on EVERY
+            # tick before the "nothing queued" early return, so an idle proxy still pays it.
             cache_keys: Final = (
-                self.get_in_memory_keys_to_update()
+                self.get_and_reset_in_memory_keys_to_update()
             )  # if no pattern OR redis cache does not support scan_iter, use in-memory keys
 
             cache_keys_list: Final = list(cache_keys)

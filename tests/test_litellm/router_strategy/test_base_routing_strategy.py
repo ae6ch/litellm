@@ -127,8 +127,11 @@ async def test_sync_in_memory_spend_with_redis(base_strategy, mock_dual_cache):
         for call in set_cache_calls
     )
 
-    # Verify cache keys still exist
-    assert len(base_strategy.in_memory_keys_to_update) == 1
+    # The sync DRAINS the dirty set. This assertion previously read `== 1`, which pinned
+    # the leak: keys were read but never cleared, so the set grew for the lifetime of the
+    # process. A key that still needs syncing is re-added by
+    # _increment_value_in_current_window, so draining loses nothing.
+    assert len(base_strategy.in_memory_keys_to_update) == 0
 
 
 @pytest.mark.asyncio
@@ -146,3 +149,53 @@ async def test_cache_keys_management(base_strategy):
     # Test resetting cache keys
     base_strategy.reset_in_memory_keys_to_update()
     assert len(base_strategy.get_in_memory_keys_to_update()) == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_does_not_accumulate_in_memory_keys(base_strategy, mock_dual_cache):
+    """
+    Regression: `in_memory_keys_to_update` must not grow without bound.
+
+    `_sync_in_memory_spend_with_redis` used to read the dirty set via
+    `get_in_memory_keys_to_update()` and never clear it, while
+    `get_and_reset_in_memory_keys_to_update()` was defined but called nowhere in the
+    package. Every key ever touched therefore stayed in the set for the lifetime of the
+    process, and each tick re-walked all of them: a batch-get over every key plus a
+    per-key merge. With `lowest_tpm_rpm_v2`'s hardcoded 0.1s interval that is 10 full
+    walks per second, so CPU climbed with uptime rather than with load -- observed in
+    production as a proxy reaching ~1 core over 2-3 days while serving <1 request/minute.
+
+    This drives the real mutation path (`_increment_value_in_current_window`, the only
+    caller of `add_to_in_memory_keys_to_update`) rather than assigning the set directly,
+    so it pins the actual invariant: sync drains, and only genuinely-changed keys return.
+    """
+
+    def _done(value):
+        fut: asyncio.Future = asyncio.Future()
+        fut.set_result(value)
+        return fut
+
+    # Fresh future per call -- these mocks are hit repeatedly across ticks.
+    mock_dual_cache.in_memory_cache.async_increment.side_effect = lambda *a, **k: _done(None)
+    mock_dual_cache.in_memory_cache.async_batch_get_cache.side_effect = lambda *a, **k: _done(["5.0"])
+    mock_dual_cache.in_memory_cache.async_get_cache.side_effect = lambda *a, **k: _done("8.0")
+    mock_dual_cache.in_memory_cache.async_set_cache.side_effect = lambda *a, **k: _done(None)
+    mock_dual_cache.redis_cache.async_increment_pipeline.side_effect = lambda *a, **k: _done([15.0])
+
+    seen_sizes = []
+    for i in range(5):
+        # Each tick touches a DIFFERENT key, exactly as real traffic across many
+        # deployments/providers does.
+        await base_strategy._increment_value_in_current_window(
+            key=f"key{i}", value=1.0, ttl=3600
+        )
+        assert base_strategy.in_memory_keys_to_update == {f"key{i}"}
+
+        await base_strategy._sync_in_memory_spend_with_redis()
+        seen_sizes.append(len(base_strategy.in_memory_keys_to_update))
+
+    # Without the drain this is [1, 2, 3, 4, 5] and keeps climbing forever.
+    assert seen_sizes == [0, 0, 0, 0, 0], (
+        f"dirty set accumulated across sync ticks: {seen_sizes}"
+    )
+    assert base_strategy.in_memory_keys_to_update == set()
