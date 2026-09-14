@@ -1189,10 +1189,21 @@ class Router:
         lists by identity. Used before re-init (`routing_strategy_init` /
         `_init_routing_groups`) so repeated `update_settings` calls don't
         accumulate dead selectors that keep receiving callback events.
+
+        Also cancels each selector's background Redis sync loop (strategies
+        that batch Redis writes, e.g. `usage-based-routing-v2`, start one at
+        construction). Removing the callback alone leaves that task running
+        forever, and the proxy re-applies router settings on every DB config
+        reload, so a long-lived proxy would otherwise accumulate one immortal
+        0.1s loop per such selector per reload.
         """
         selector_ids: Final = {id(s) for s in selectors if s is not None}
         if not selector_ids:
             return
+        for selector in selectors:
+            sync_task = getattr(selector, "_sync_task", None)
+            if isinstance(sync_task, asyncio.Task) and not sync_task.done():
+                sync_task.cancel()
         if isinstance(litellm.callbacks, list):
             litellm.callbacks = [c for c in litellm.callbacks if id(c) not in selector_ids]
         if isinstance(litellm.input_callback, list):

@@ -5,6 +5,7 @@ the implicit `"default"` group driven by the router's top-level
 `routing_strategy` / `routing_strategy_args`.
 """
 
+import asyncio
 from unittest.mock import patch
 
 import pytest
@@ -405,6 +406,68 @@ def test_update_settings_does_not_leak_strategy_callbacks(monkeypatch):
     ), "old group selector instance leaked into litellm.callbacks"
     group_selector_v2 = router._group_selectors["fast"]["latency-based-routing"]
     assert group_selector_v2 is not group_selector_v1
+
+
+def _live_sync_tasks():
+    return [
+        t
+        for t in asyncio.all_tasks()
+        if not t.done() and t.get_coro().__name__ == "periodic_sync_in_memory_spend_with_redis"
+    ]
+
+
+async def test_update_settings_cancels_replaced_selector_sync_tasks(monkeypatch):
+    """
+    `usage-based-routing-v2` selectors own a background Redis sync loop that
+    wakes every 0.1s. Replacing a selector must cancel that loop: dropping it
+    from `litellm.callbacks` alone leaves the task running forever.
+
+    The proxy re-applies router settings from the DB on every config reload
+    (every 30s by default), so without cancellation a long-running proxy
+    accumulates one immortal loop per v2 selector per reload and ends up
+    pinning a CPU core with no traffic at all.
+    """
+    monkeypatch.setattr(litellm, "callbacks", [])
+    monkeypatch.setattr(litellm, "input_callback", [])
+    groups = [
+        {
+            "group_name": "fast",
+            "models": ["filtered-model"],
+            "routing_strategy": "usage-based-routing-v2",
+        }
+    ]
+    router = _build_router(routing_strategy="usage-based-routing-v2", routing_groups=groups)
+    try:
+        default_selector = router.lowesttpm_logger_v2
+        first_group_selector = router._group_selectors["fast"]["usage-based-routing-v2"]
+        assert not default_selector._sync_task.done()
+        assert not first_group_selector._sync_task.done()
+        assert len(_live_sync_tasks()) == 2
+
+        # The proxy's reload shape: identical settings re-applied. The default
+        # selector is kept (strategy unchanged), but routing groups are rebuilt
+        # on every call, so this is the path that leaked in production.
+        for _ in range(5):
+            router.update_settings(routing_strategy="usage-based-routing-v2", routing_groups=groups)
+
+        assert router._group_selectors["fast"]["usage-based-routing-v2"] is not first_group_selector
+        _, pending = await asyncio.wait([first_group_selector._sync_task], timeout=2)
+        assert not pending, "replaced group selector's sync loop is still running"
+        assert first_group_selector._sync_task.cancelled()
+        assert router.lowesttpm_logger_v2 is default_selector
+        assert not default_selector._sync_task.done(), "the kept default selector's loop must survive"
+        # One loop per CURRENT selector, however many rebuilds happened.
+        assert len(_live_sync_tasks()) == 2
+
+        # Changing the top-level strategy replaces the default selector via
+        # routing_strategy_init; its loop must be cancelled too.
+        router.update_settings(routing_strategy="least-busy")
+        _, pending = await asyncio.wait([default_selector._sync_task], timeout=2)
+        assert not pending, "replaced default selector's sync loop is still running"
+        assert len(_live_sync_tasks()) == 1  # only the group's v2 loop remains
+    finally:
+        for task in _live_sync_tasks():
+            task.cancel()
 
 
 def test_update_settings_unregisters_group_selectors_when_groups_removed(monkeypatch):
